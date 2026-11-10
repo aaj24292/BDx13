@@ -17,10 +17,6 @@ from aiohttp import web
 API_TOKEN = os.environ.get('API_TOKEN')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 ADMIN_ID = 1654131109  # آیدی شما
-
-SPONSOR_CHANNELS = [
-    '@BDSM_X13'  # کانال شما
-]
 # ==========================================
 
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +48,20 @@ async def start_dummy_server():
     await site.start()
     logging.info(f"Dummy web server started on port {port}")
 
+# --- راه‌اندازی جدول‌های دیتابیس در صورت عدم وجود ---
+async def init_db():
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sponsor_channels (
+                id SERIAL PRIMARY KEY,
+                channel_username TEXT UNIQUE NOT NULL
+            )
+        """)
+        # اگر جدول خالی است، کانال پیش‌فرض را اضافه کن
+        count = await conn.fetchval("SELECT COUNT(*) FROM sponsor_channels")
+        if count == 0:
+            await conn.execute("INSERT INTO sponsor_channels (channel_username) VALUES ($1) ON CONFLICT DO NOTHING", "@BDSM_X13")
+
 # --- توابع کمکی ---
 
 def get_tags_keyboard(request_id, selected_tags=None):
@@ -66,15 +76,22 @@ def get_tags_keyboard(request_id, selected_tags=None):
     builder.row(InlineKeyboardButton(text="Save & Finish", callback_data=f"save:{request_id}"))
     return builder.as_markup()
 
+async def get_sponsor_channels():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT channel_username FROM sponsor_channels")
+        return [row['channel_username'] for row in rows]
+
 async def check_subscription(user_id):
-    if not SPONSOR_CHANNELS:
+    channels = await get_sponsor_channels()
+    if not channels:
         return True
-    for channel in SPONSOR_CHANNELS:
+    for channel in channels:
         try:
             member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
             if member.status in ['left', 'kicked']:
                 return False
         except Exception:
+            # اگر ربات نتواند وضعیت را بخواند (مثلاً ادمین نباشد یا یوزرنيم اشتباه باشد)، سخت‌گیرانه رد می‌کند یا خطا را رد می‌کند
             continue
     return True
 
@@ -89,11 +106,18 @@ async def delete_message_delayed(chat_id, message_id, delay):
 
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def admin_dashboard(message: types.Message):
+    channels = await get_sponsor_channels()
+    channels_str = "\n".join([f"▫️ {ch}" for ch in channels]) or "هیچ کانالی ثبت نشده است."
+    
     help_text = (
         "<b>👮‍♂️ داشبورد مدیریت</b>\n\n"
+        "📢 <b>کانال‌های جوین اجباری فعلی:</b>\n"
+        f"{channels_str}\n\n"
+        "➕ اضافه کردن کانال:\n<code>/addchannel @channel_username</code>\n"
+        "❌ حذف کردن کانال:\n<code>/delchannel @channel_username</code>\n\n"
         "🔹 <code>/pack Oral 10</code>\n"
         "🔹 <code>/link v50</code>\n\n"
-        "<b>📊 آمار:</b> (کل / منتشر شده / <b>آماده</b>)\n\n"
+        "<b>📊 آمار ویدیوها:</b>\n"
     )
     stats_text = ""
     try:
@@ -111,6 +135,40 @@ async def admin_dashboard(message: types.Message):
     except Exception as e:
         help_text += f"\n⚠️ Error: {e}"
     await message.reply(help_text, parse_mode="HTML")
+
+@dp.message(Command("addchannel"), F.from_user.id == ADMIN_ID)
+async def add_sponsor_channel(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("فرمت صحیح:\n`/addchannel @username`", parse_mode="Markdown")
+        return
+    ch_username = args[1]
+    if not ch_username.startswith('@'):
+        ch_username = f"@{ch_username}"
+        
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO sponsor_channels (channel_username) VALUES ($1) ON CONFLICT DO NOTHING", ch_username)
+        await message.reply(f"✅ کانال {ch_username} با موفقیت به لیست جوین اجباری اضافه شد.")
+    except Exception as e:
+        await message.reply(f"خطا در ثبت کانال: {e}")
+
+@dp.message(Command("delchannel"), F.from_user.id == ADMIN_ID)
+async def delete_sponsor_channel(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("فرمت صحیح:\n`/delchannel @username`", parse_mode="Markdown")
+        return
+    ch_username = args[1]
+    if not ch_username.startswith('@'):
+        ch_username = f"@{ch_username}"
+        
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM sponsor_channels WHERE channel_username = $1", ch_username)
+        await message.reply(f"🗑 کانال {ch_username} از لیست حذف شد.")
+    except Exception as e:
+        await message.reply(f"خطا در حذف کانال: {e}")
 
 @dp.message(F.video, F.from_user.id == ADMIN_ID)
 async def admin_upload_video(message: types.Message):
@@ -161,7 +219,6 @@ async def save_video_to_db(callback_query: types.CallbackQuery):
     
     try:
         async with db_pool.acquire() as conn:
-            # اینسرت و دریافت آیدی در یک خط
             video_id = await conn.fetchval(
                 "INSERT INTO videos (file_id, file_unique_id, tags) VALUES ($1, $2, $3) RETURNING id",
                 data['file_id'], data['file_unique_id'], tags_str
@@ -209,7 +266,6 @@ async def create_pack(message: types.Message):
             
             await message.reply(response_text, parse_mode="HTML", disable_web_page_preview=True)
             
-            # آپدیت دسته‌جمعی رکوردها
             await conn.execute("UPDATE videos SET is_published = TRUE, pack_id = $1 WHERE id = ANY($2::int[])", batch_id, ids_to_update)
             
             await message.reply(f"{len(videos)} videos marked as published.")
@@ -254,18 +310,22 @@ async def user_start(message: types.Message):
     args = message.text.split(' ')
     payload = args[1] if len(args) > 1 else None
     
+    # بررسی جوین بودن در تمام کانال‌های اسپانسر ثبت شده
     if not await check_subscription(message.from_user.id):
         builder = InlineKeyboardBuilder()
-        for ch in SPONSOR_CHANNELS:
+        channels = await get_sponsor_channels()
+        
+        for idx, ch in enumerate(channels, 1):
             url_channel = ch.replace('@', '')
             url = f"https://t.me/{url_channel}"
-            builder.button(text="Join Channel", url=url)
+            builder.button(text=f"📢 Join Channel {idx}", url=url)
         
         bot_info = await bot.get_me()
         start_param = f"?start={payload}" if payload else ""
         retry_url = f"https://t.me/{bot_info.username}{start_param}"
-        builder.row(InlineKeyboardButton(text="Joined / Watch Video", url=retry_url))
-        await message.reply("🔒 **To watch the video, you must join our channel first:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
+        builder.row(InlineKeyboardButton(text="✅ Joined / Watch Video", url=retry_url))
+        
+        await message.reply("🔒 **To watch the video, you must join all our channels first:**", reply_markup=builder.as_markup(), parse_mode="Markdown")
         return
 
     if not payload:
@@ -327,18 +387,22 @@ async def user_start(message: types.Message):
             await message.reply("Video not found.")
             
     except Exception:
+        asyncio.sleep(1)
         await message.reply("System busy.")
 
 async def main():
-    # ۱. استارت وب‌سرور فیک
-    await start_dummy_server()
-    
-    # ۲. اتصال به دیتابیس نئون
+    # ۱. اتصال به دیتابیس نئون
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     logging.info("Connected to Neon Database successfully!")
     
-    # ۳. استارت ربات
+    # ۲. ساخت جدول‌های مورد نیاز اگر وجود نداشته باشند
+    await init_db()
+
+    # ۳. استارت وب‌سرور فیک
+    await start_dummy_server()
+    
+    # ۴. استارت ربات
     logging.info("Bot is polling on Render...")
     await dp.start_polling(bot)
 
