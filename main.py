@@ -167,19 +167,34 @@ async def get_sponsor_channels() -> list[str]:
     return [row["channel_username"] for row in rows]
 
 
-async def check_subscription(user_id: int) -> bool:
-    """Fail closed: any channel membership verification error denies access."""
-    channels = await get_sponsor_channels()
-    for channel in channels:
-        try:
-            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-            status = str(member.status)
-            if status in {"left", "kicked"}:
-                return False
-        except TelegramAPIError:
-            logger.exception("Could not verify user %s in sponsor channel %s", user_id, channel)
-            return False
-    return True
+async def get_missing_sponsor_channels(user_id: int) -> list[str] | None:
+    """Return channels the user has not joined; None means verification failed."""
+    try:
+        channels = await get_sponsor_channels()
+        if not channels:
+            logger.error("No mandatory-join channels are configured.")
+            return None
+
+        missing_channels: list[str] = []
+        for channel in channels:
+            try:
+                member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+                status = str(member.status)
+                is_member = (
+                    status in {"creator", "administrator", "member"}
+                    or (status == "restricted" and getattr(member, "is_member", False))
+                )
+                if not is_member:
+                    missing_channels.append(channel)
+            except TelegramAPIError:
+                logger.exception(
+                    "Could not verify user %s in sponsor channel %s", user_id, channel
+                )
+                return None
+        return missing_channels
+    except Exception:
+        logger.exception("Sponsor channel verification failed.")
+        return None
 
 
 async def delete_message_delayed(chat_id: int, message_id: int, delay: int) -> None:
@@ -279,8 +294,18 @@ async def add_sponsor_channel(message: types.Message) -> None:
         return
     try:
         channel = normalize_channel(args[1])
-        # Check that Telegram can resolve this channel for the bot.
-        await bot.get_chat(channel)
+        # Verify bot access and administrator status without get_chat().
+        # Older aiogram versions fail to parse Telegram's newer paid-reaction
+        # field in the Chat object returned by get_chat().
+        bot_info = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=channel, user_id=bot_info.id)
+        bot_status = str(bot_member.status)
+        if bot_status not in {"administrator", "creator"}:
+            await message.reply(
+                "The bot must be an administrator in that channel before it can be added."
+            )
+            return
+
         pool = require_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
@@ -296,9 +321,12 @@ async def add_sponsor_channel(message: types.Message) -> None:
     except TelegramAPIError:
         logger.exception("Telegram could not resolve sponsor channel")
         await message.reply("Telegram could not access that channel. Check the username and bot permissions.")
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to add sponsor channel")
-        await message.reply("Could not save the channel due to a database error.")
+        await message.reply(
+            f"Could not add the channel ({type(exc).__name__}). "
+            "Check the Render logs for details."
+        )
 
 
 @dp.message(Command("delchannel"), F.from_user.id == ADMIN_ID)
@@ -605,30 +633,44 @@ async def user_start(message: types.Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     payload = parts[1].strip() if len(parts) > 1 else None
 
-    if not await check_subscription(message.from_user.id):
+    missing_channels = await get_missing_sponsor_channels(message.from_user.id)
+    if missing_channels is None:
+        await message.reply(
+            "⚠️ We could not verify your channel membership right now. "
+            "Please try again later."
+        )
+        return
+
+    if missing_channels:
         builder = InlineKeyboardBuilder()
-        channels = await get_sponsor_channels()
-        for index, channel in enumerate(channels, 1):
+        for channel in missing_channels:
             url_channel = channel.removeprefix("@")
             builder.button(
-                text=f"📢 Join Channel {index}",
+                text=f"📢 Join {channel}",
                 url=f"https://t.me/{url_channel}",
             )
+
         bot_info = await bot.get_me()
         if not bot_info.username:
             await message.reply("Bot configuration error. Please try again later.")
             return
+
         start_param = f"?start={payload}" if payload else ""
         retry_url = f"https://t.me/{bot_info.username}{start_param}"
         builder.row(InlineKeyboardButton(text="✅ Joined / Check Again", url=retry_url))
         await message.reply(
-            "🔒 You must join all sponsor channels before accessing the content.",
+            "🔒 Please join the following channels to access the content:",
             reply_markup=builder.as_markup(),
         )
         return
 
     if not payload:
-        await message.reply("Use a valid video link from the channel.")
+        await message.reply(
+            "Welcome to BDSM X13!\n\n"
+            "To access videos, please use a valid video link "
+            "from our main channel:\n"
+            "👉 @BDSM_X13"
+        )
         return
 
     pool = require_pool()
