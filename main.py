@@ -179,7 +179,8 @@ async def get_missing_sponsor_channels(user_id: int) -> list[str] | None:
         for channel in channels:
             try:
                 member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-                status = str(member.status)
+                # aiogram status is an Enum; compare its value, not str(Enum).
+                status = getattr(member.status, "value", member.status)
                 is_member = (
                     status in {"creator", "administrator", "member"}
                     or (status == "restricted" and getattr(member, "is_member", False))
@@ -299,7 +300,8 @@ async def add_sponsor_channel(message: types.Message) -> None:
         # field in the Chat object returned by get_chat().
         bot_info = await bot.get_me()
         bot_member = await bot.get_chat_member(chat_id=channel, user_id=bot_info.id)
-        bot_status = str(bot_member.status)
+        # Extract Enum.value so administrator status is detected reliably.
+        bot_status = getattr(bot_member.status, "value", bot_member.status)
         if bot_status not in {"administrator", "creator"}:
             await message.reply(
                 "The bot must be an administrator in that channel before it can be added."
